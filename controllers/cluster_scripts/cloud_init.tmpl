@@ -147,17 +147,16 @@ write_files:
     echo "$(date) post customization script execution completed" &>> /var/log/capvcd/customization/status.log
     exit 0
 runcmd:
-- 'cloud-init clean'
-- '[ ! -f /opt/vmware/cloud-director/metering.sh ] && sudo reboot'
-- '[ ! -f /etc/cloud/cloud.cfg.d/cse.cfg ] && sudo reboot'
-- '[ ! -f /etc/vcloud/metering ] && sudo reboot'
+- '[ ! -f /opt/vmware/cloud-director/metering.sh ] && cloud-init clean && sudo reboot'
+- '[ ! -f /etc/cloud/cloud.cfg.d/cse.cfg ] && cloud-init clean && sudo reboot'
+- '[ ! -f /etc/vcloud/metering ] && cloud-init clean && sudo reboot'
 {{ if .ControlPlane }}
-- '[ ! -f /root/control_plane.sh ] && sudo reboot'
-- '[ ! -f /run/kubeadm/kubeadm.yaml ] && sudo reboot'
+- '[ ! -f /root/control_plane.sh ] && cloud-init clean && sudo reboot'
+- '[ ! -f /run/kubeadm/kubeadm.yaml ] && cloud-init clean && sudo reboot'
 - bash /root/control_plane.sh
 {{ else }}
-- '[ ! -f /root/node.sh ] && sudo reboot'
-- '[ ! -f /run/kubeadm/kubeadm-join-config.yaml ] && sudo reboot'
+- '[ ! -f /root/node.sh ] && cloud-init clean && sudo reboot'
+- '[ ! -f /run/kubeadm/kubeadm-join-config.yaml ] && cloud-init clean && sudo reboot'
 - bash /root/node.sh
 {{ end }}
 timezone: UTC
