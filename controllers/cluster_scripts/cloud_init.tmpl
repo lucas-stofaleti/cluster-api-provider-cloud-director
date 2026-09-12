@@ -39,22 +39,43 @@ write_files:
   content: |
     #!/usr/bin/env bash
     catch() {
-      vmtoolsd --cmd "info-set guestinfo.post_customization_script_execution_status $?"
-      ERROR_MESSAGE="$(date) $(caller): $BASH_COMMAND"
+      # Capture these before anything else runs: EXIT_STATUS must come from a bare
+      # assignment (which does not itself invoke a pipeline) so it still holds the
+      # failing command's own status, and PIPE_STATUS must be read on the very next
+      # statement, before any other command (even the vmtoolsd call below) overwrites
+      # it. This is what lets a pipeline failure (e.g. a command piped into something
+      # that exits early) be told apart from the last stage's own exit code.
+      EXIT_STATUS=$?
+      PIPE_STATUS="${PIPESTATUS[*]}"
+
+      # Every vmtoolsd call below is guarded with "|| echo ... error.log" on purpose.
+      # catch() runs as an ERR/EXIT trap while `set -e` is still in effect, so without
+      # the guard, a single failed guestinfo write (e.g. a transient VMware Tools
+      # channel hiccup -- plausible if that's what caused the original failure too)
+      # would abort catch() itself and silently skip every diagnostic after it. That is
+      # the likely explanation for failures reported with an empty reason in the past.
+      vmtoolsd --cmd "info-set guestinfo.post_customization_script_execution_status $EXIT_STATUS" || echo "$(date) failed to report guestinfo.post_customization_script_execution_status" &>> /var/log/capvcd/customization/error.log
+
+      ERROR_MESSAGE="$(date) $(caller): $BASH_COMMAND (pipestatus: $PIPE_STATUS)"
       echo "$ERROR_MESSAGE" &>> /var/log/capvcd/customization/error.log
-      if [[ -s /root/kubeadm.err ]]
-      then
-        KUBEADM_FAILURE=$(cat /root/kubeadm.err)
-        ERROR_MESSAGE="$ERROR_MESSAGE $KUBEADM_FAILURE"
-      fi
-      vmtoolsd --cmd "info-set guestinfo.post_customization_script_execution_failure_reason $ERROR_MESSAGE"
+      # Read both streams of the bootstrap run block: a failure can land on stdout
+      # (e.g. a command piped into something that exits early) just as easily as on
+      # stderr, and only checking kubeadm.err missed those entirely.
+      for BOOTSTRAP_LOG in /root/kubeadm.out /root/kubeadm.err
+      do
+        if [[ -s "$BOOTSTRAP_LOG" ]]
+        then
+          ERROR_MESSAGE="$ERROR_MESSAGE $BOOTSTRAP_LOG: $(cat "$BOOTSTRAP_LOG")"
+        fi
+      done
+      vmtoolsd --cmd "info-set guestinfo.post_customization_script_execution_failure_reason $ERROR_MESSAGE" || echo "$(date) failed to report guestinfo.post_customization_script_execution_failure_reason" &>> /var/log/capvcd/customization/error.log
 
       CLOUD_INIT_OUTPUT=""
       if [[ -f /var/log/cloud-init-output.log ]]
       then
         CLOUD_INIT_OUTPUT=$(</var/log/cloud-init-output.log)
       fi
-      vmtoolsd --cmd "info-set guestinfo.post_customization_cloud_init_output $CLOUD_INIT_OUTPUT"
+      vmtoolsd --cmd "info-set guestinfo.post_customization_cloud_init_output $CLOUD_INIT_OUTPUT" || echo "$(date) failed to report guestinfo.post_customization_cloud_init_output" &>> /var/log/capvcd/customization/error.log
     }
 
     wait_for_containerd_startup() {
@@ -135,7 +156,7 @@ write_files:
     set +x
     {
       {{ .BootstrapRunCmd }}
-    } 2> /root/kubeadm.err
+    } > /root/kubeadm.out 2> /root/kubeadm.err
     set -x
     if [[ ! -f /run/cluster-api/bootstrap-success.complete ]]
     then
