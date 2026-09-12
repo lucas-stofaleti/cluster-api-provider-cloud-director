@@ -891,6 +891,38 @@ func CreateFullVAppName(ctx context.Context, cli client.Client, ovdcID string,
 	}
 }
 
+// vAppHasNetworkAttached reports whether ovdcNetworkName is already present in vApp's
+// network configuration.
+//
+// This intentionally mirrors the vendored, unexported
+// VdcManager.isVappNetworkPresentInVapp (cloud-provider-for-cloud-director's
+// pkg/vcdsdk/vapp.go) field-for-field: GetOrCreateVApp uses that exact check to decide
+// whether it needs to mutate an already-existing vApp (by adding the network to it), and
+// callers here need to make the same decision *before* calling GetOrCreateVApp in order
+// to know whether the call can safely skip the vApp's mutation lock. CAPVCD cannot call
+// the unexported method directly, so this is kept as a byte-for-byte copy rather than a
+// approximation -- if it drifts from the upstream check, a vApp missing its network
+// could wrongly be treated as already-attached, so keep it in sync if that check ever
+// changes upstream.
+//
+// It is deliberately conservative: a nil vApp, nil VApp, or nil/absent network sections
+// all yield false, matching the vendored function precisely, so an uncertain state is
+// always treated as "not attached" and routed through the safe, locked path.
+func vAppHasNetworkAttached(vApp *govcd.VApp, ovdcNetworkName string) bool {
+	if vApp == nil || vApp.VApp == nil {
+		return false
+	}
+	if vApp.VApp.NetworkConfigSection == nil || vApp.VApp.NetworkConfigSection.NetworkConfig == nil {
+		return false
+	}
+	for _, vAppNetwork := range vApp.VApp.NetworkConfigSection.NetworkNames() {
+		if vAppNetwork == ovdcNetworkName {
+			return true
+		}
+	}
+	return false
+}
+
 // vAppMetadataMatches reports whether every entry of want is already present on the
 // vApp with the same value. It reads the vApp's metadata once, regardless of how many
 // keys are checked.
@@ -960,27 +992,52 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 		log.Error(err, "failed to remove VCDClusterError from RDE", "rdeID", vcdCluster.Status.InfraId)
 	}
 
-	_, err = vdcManager.Vdc.GetVAppByName(vAppName, true)
+	existingVApp, err := vdcManager.Vdc.GetVAppByName(vAppName, true)
 	if err != nil && err == govcd.ErrorEntityNotFound {
 		vcdCluster.Status.VAppMetadataUpdated = false
 	}
 
-	// GetOrCreateVApp only actually mutates VCD the first time this cluster's vApp is
-	// created; every later call just reads it back. Locking unconditionally is still
-	// correct and cheap: the lock is only ever contended on that one first call, when
-	// several machines' initial reconciles could otherwise race each other to create the
-	// same vApp.
+	// vAppLock is needed unconditionally below (for the metadata write further down),
+	// even on the fast path that skips locking GetOrCreateVApp itself. Fetching it here
+	// is just a sync.Map lookup, not a lock acquisition, so it is always cheap.
 	vAppLock := r.vAppMutationLock(vAppName)
-	clusterVApp, err := func() (*govcd.VApp, error) {
-		vAppLock.Lock()
-		defer vAppLock.Unlock()
-		return vdcManager.GetOrCreateVApp(vAppName, ovdcNetworkName)
-	}()
-	if err != nil {
-		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "", vAppName,
-			fmt.Sprintf("%v", err))
-		return ctrl.Result{}, errors.Wrapf(err, "Error creating Infra vApp for the cluster [%s]: [%v]",
-			vcdCluster.Name, err)
+
+	// GetOrCreateVApp only actually mutates VCD when the vApp doesn't exist yet, or when
+	// it exists but the requested ovdc network isn't attached to it -- every other case
+	// is just the read above, repeated. We already have that read's result in hand, so
+	// when neither mutation case applies, reuse it directly and skip the lock entirely
+	// instead of taking it only to have GetOrCreateVApp redo the identical read
+	// internally and hand back an equivalent object.
+	//
+	// This is not just a saved API call: every machine funnels through this check on
+	// every reconcile while it is still provisioning, and if it lands while another
+	// machine's real mutation (a disk resize can run tens of seconds) is in flight, it
+	// would otherwise queue behind that unrelated mutation for no reason -- it was only
+	// ever going to read. Skipping the lock here keeps pure reads from competing for the
+	// same turn as machines that actually need to mutate the vApp. Measured on a busy
+	// vApp, that queueing was costing 27-80s per reconcile for a call that, freed of the
+	// wait, completes in a fraction of a second.
+	//
+	// A real error from the read above (anything other than ErrorEntityNotFound) also
+	// falls through to the locked path below: GetOrCreateVApp performs the identical
+	// read internally, so it will simply encounter and report the same error through its
+	// existing, already-correct error handling rather than this needing a second copy of
+	// it here.
+	var clusterVApp *govcd.VApp
+	if err == nil && vAppHasNetworkAttached(existingVApp, ovdcNetworkName) {
+		clusterVApp = existingVApp
+	} else {
+		clusterVApp, err = func() (*govcd.VApp, error) {
+			vAppLock.Lock()
+			defer vAppLock.Unlock()
+			return vdcManager.GetOrCreateVApp(vAppName, ovdcNetworkName)
+		}()
+		if err != nil {
+			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "", vAppName,
+				fmt.Sprintf("%v", err))
+			return ctrl.Result{}, errors.Wrapf(err, "Error creating Infra vApp for the cluster [%s]: [%v]",
+				vcdCluster.Name, err)
+		}
 	}
 	if clusterVApp == nil || clusterVApp.VApp == nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "",
