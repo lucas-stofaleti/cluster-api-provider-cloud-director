@@ -686,11 +686,12 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 			return errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; error waiting for VM power-on task completion", vcdCluster.Name, vm.VM.Name)
 		}
 
-		if err = vApp.Refresh(); err != nil {
-			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
-
-			return errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; unable to refresh vapp after VM power-on", vAppName, vm.VM.Name)
-		}
+		// vApp is deliberately not refreshed here. Its result was never read: nothing
+		// below this point in the function -- or in reconcileVM/reconcileNormal after
+		// this function returns -- reads vApp again (they all use vm, not vApp). Same
+		// reasoning as the two vApp.Refresh() removals documented further down in this
+		// function; a deep vApp fetch measures at roughly 10 seconds in this environment,
+		// so a call whose result nobody reads is not a trivial thing to leave in place.
 	}
 
 	if hasCloudInitFailedBefore, err := r.hasCloudInitExecutionFailedBefore(vcdClient, vm); hasCloudInitFailedBefore {
@@ -1135,7 +1136,14 @@ func (r *VCDMachineReconciler) reconcileVM(
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(vcdClient, vcdCluster.Status.InfraId)
 
 	vmExists := true
-	vm, err := vApp.GetVMByName(vmName, true)
+	// refresh=false: vApp was fetched fresh by the caller (reconcileVAppCreation, via
+	// reconcileNormal) immediately before this call, with no mutation in between -- a
+	// refresh here would just re-fetch the identical, already-current document. A deep
+	// vApp fetch measures at roughly 10 seconds in this environment, so this is not a
+	// trivial saving. GetVMByName still fetches the individual VM by its own HREF
+	// regardless of refresh, so this only skips the redundant *vApp-wide* re-fetch, not
+	// the read of the VM itself.
+	vm, err := vApp.GetVMByName(vmName, false)
 	if err != nil && err != govcd.ErrorEntityNotFound {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "",
 			machine.Name, fmt.Sprintf("%v", err))
@@ -2058,7 +2066,10 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		vm, err := vApp.GetVMByName(vmName, true)
+		// refresh=false: vApp was fetched fresh just above in this same reconcile, and
+		// only RDE bookkeeping calls (no vApp mutation) happened in between, so it is
+		// still current. See the identical reasoning in reconcileVM.
+		vm, err := vApp.GetVMByName(vmName, false)
 		if err != nil {
 			if err == govcd.ErrorEntityNotFound {
 				log.Error(err, "Error while deleting the machine; VM  not found")
