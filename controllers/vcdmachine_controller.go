@@ -375,7 +375,7 @@ var vAppContentionCodes = []string{
 //
 // This matches on the error text rather than asserting on *types.Error. govcd does return a
 // typed error carrying MinorErrorCode, but the wrapping chain between here and there uses
-// %s/%v rather than %w (see vcdsdk.AddNewTkgVM and govcd's ExecuteTaskRequest), so the type
+// %s/%v rather than %w (see addTkgVMToVApp and govcd's ExecuteTaskRequest), so the type
 // is flattened to a string before this code sees it. If that chain is ever changed to wrap
 // with %w, this should become an errors.As check against *types.Error.MinorErrorCode.
 func isVAppContentionError(err error) bool {
@@ -1187,14 +1187,25 @@ func (r *VCDMachineReconciler) reconcileVM(
 
 		// vcda-4391 fixed
 		//
+		// The catalog, template, policy and storage profile lookups do not depend on the vApp's
+		// state, so they run before taking the vApp-wide lock.
+		spec, err := resolveTkgVMCreationSpec(vdcManager, vmName,
+			vcdMachine.Spec.Catalog, vcdMachine.Spec.Template, vcdMachine.Spec.PlacementPolicy,
+			vcdMachine.Spec.SizingPolicy, vcdMachine.Spec.StorageProfile)
+		if err != nil {
+			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name,
+				fmt.Sprintf("%v", err))
+			return ctrl.Result{}, nil, "", errors.Wrapf(err,
+				"Error provisioning infrastructure for the machine; unable to create VM [%s] in vApp [%s]",
+				machine.Name, vAppName)
+		}
+
 		// Both the create call and waiting for its task happen under the lock: VCD's
 		// serialisation covers the whole task, not just accepting the request.
 		task, err, failedWaitingForTask := func() (govcd.Task, error, bool) {
 			unlock := r.lockSetFor(vAppName).lockVAppWide()
 			defer unlock()
-			task, err := vdcManager.AddNewTkgVM(vmName, vAppName,
-				vcdMachine.Spec.Catalog, vcdMachine.Spec.Template, vcdMachine.Spec.PlacementPolicy,
-				vcdMachine.Spec.SizingPolicy, vcdMachine.Spec.StorageProfile)
+			task, err := addTkgVMToVApp(vdcManager, vApp, spec)
 			if err != nil {
 				return task, err, false
 			}
