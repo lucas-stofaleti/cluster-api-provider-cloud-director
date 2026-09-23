@@ -7,6 +7,7 @@ package controllers
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	_ "embed" // this needs go 1.16+
 	b64 "encoding/base64"
@@ -17,9 +18,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
-	"compress/gzip"
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/go-logr/logr"
@@ -100,6 +101,83 @@ var ignitionNetworkInitScriptTemplate string
 // VCDMachineReconciler reconciles a VCDMachine object
 type VCDMachineReconciler struct {
 	client.Client
+
+	// vAppContentionDeferrals counts, per machine, how many times in a row one of its VCD
+	// operations has been deferred because the vApp was busy with another task. It bounds the deferrals so
+	// a permanently blocked vApp still surfaces as an error rather than retrying silently
+	// forever. Keyed by client.ObjectKey; values are int.
+	//
+	// A sync.Map is used because reconciles run concurrently (--concurrency, default 10)
+	// and its zero value is ready to use, so no change is needed where the reconciler is
+	// constructed. The state is intentionally in-memory only: losing it on restart just
+	// resets the deferral counts, which is harmless.
+	vAppContentionDeferrals sync.Map
+
+	// vAppLocks holds one *vAppLockSet per vApp name, so that goroutines in this process
+	// (--concurrency, default 10) do not race each other into VCD's own per-vApp
+	// serialisation. deferOnVAppContention handles contention that still comes from outside
+	// this process. Keyed by vApp name because that is what VCD serialises on.
+	vAppLocks sync.Map
+}
+
+// vAppLockSet is the set of in-process locks for one vApp. The split mirrors what VCD was
+// measured to serialise, both in direct API tests (CI tenant) and in the task history of
+// rollouts that ran without any lock:
+//   - adding a VM (recompose) is rejected while any other change to the vApp or its VMs is
+//     running, and rejects them while it runs;
+//   - network-connection updates and extra-config writes (which resend the NIC section) are
+//     rejected while another of either kind runs on a different VM of the same vApp;
+//   - disk resize, power-on/off and VM deletion on different VMs run concurrently.
+//
+// Hold a lock only for the mutating call plus waiting for its task, never around polling or
+// reads. Always go through the lock* methods: they encode the acquisition order (vApp before
+// nic), and no caller may hold one of these locks while acquiring another.
+type vAppLockSet struct {
+	// vApp is held exclusively for vApp-wide changes and shared for per-VM changes.
+	vApp sync.RWMutex
+	// nic serialises network-connection updates and extra-config writes.
+	nic sync.Mutex
+	// metadata serialises vApp metadata writes, which VCD accepts during a VM add.
+	metadata sync.Mutex
+}
+
+// lockVAppWide is for changes to the vApp itself: adding a VM, creating the vApp, attaching a
+// network to it. It waits for every in-flight per-VM change; sync.RWMutex also stops new
+// per-VM changes from starting once this is waiting, so it cannot be starved.
+func (l *vAppLockSet) lockVAppWide() (unlock func()) {
+	l.vApp.Lock()
+	return l.vApp.Unlock
+}
+
+// lockVM is for per-VM changes that VCD runs concurrently across VMs: disk resize,
+// power-on/off, deleting a VM.
+func (l *vAppLockSet) lockVM() (unlock func()) {
+	l.vApp.RLock()
+	return l.vApp.RUnlock
+}
+
+// lockVMNIC is for per-VM changes VCD serialises against each other across VMs: network
+// connection updates and extra-config writes.
+func (l *vAppLockSet) lockVMNIC() (unlock func()) {
+	l.vApp.RLock()
+	l.nic.Lock()
+	return func() {
+		l.nic.Unlock()
+		l.vApp.RUnlock()
+	}
+}
+
+// lockMetadata is for vApp metadata writes.
+func (l *vAppLockSet) lockMetadata() (unlock func()) {
+	l.metadata.Lock()
+	return l.metadata.Unlock
+}
+
+// lockSetFor returns the lock set for the named vApp. Entries are never removed: their number
+// is bounded by the vApps this controller has managed, so a deleted vApp leaves a few bytes.
+func (r *VCDMachineReconciler) lockSetFor(vAppName string) *vAppLockSet {
+	locks, _ := r.vAppLocks.LoadOrStore(vAppName, &vAppLockSet{})
+	return locks.(*vAppLockSet)
 }
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vcdmachines,verbs=get;list;watch;create;update;patch;delete
@@ -258,6 +336,106 @@ func strInSlice(findStr string, arr []string) bool {
 }
 
 const phaseSecondTimeout = 600
+
+const (
+	// maxVAppContentionDeferrals bounds how many consecutive times a single machine will
+	// quietly defer because the vApp is busy. Past this the error is returned normally so
+	// that it surfaces on the VCDMachine, reaches the RDE error set, and engages
+	// controller-runtime's backoff. Without a bound a genuinely wedged vApp would be
+	// retried forever and never reported.
+	maxVAppContentionDeferrals = 30
+
+	// vAppContentionRequeueBase and vAppContentionRequeueJitter set how long to wait before
+	// retrying a machine that lost a race for the vApp. The jitter matters: without it the
+	// deferred machines re-synchronise and collide again on the same tick.
+	vAppContentionRequeueBase   = 5 * time.Second
+	vAppContentionRequeueJitter = 10 * time.Second
+)
+
+// vAppContentionCodes are the VCD minor error codes returned when an operation is refused
+// because another task already holds the vApp. VCD serialises mutations per vApp, so these
+// are expected whenever machines are created concurrently -- they mean "try again shortly",
+// not "this failed".
+//
+// Only codes that unambiguously name the busy entity are listed. Bare HTTP 500 responses
+// ("Unable to perform this action. Contact your cloud administrator.") are deliberately
+// excluded even though they are also frequently contention: VCD returns the same generic
+// message for genuine faults, and treating those as contention would retry real errors
+// indefinitely. Excluding them means contention handling is partial, which is the safe
+// direction -- an unmatched contention error simply behaves as it does today.
+var vAppContentionCodes = []string{
+	"BUSY_ENTITY",
+	"VDC_RECOMPOSE_VAPP",
+	"VAPP_UPDATE_VM",
+	"VAPP_DEPLOY",
+}
+
+// isVAppContentionError reports whether err is VCD refusing an operation because the vApp
+// is busy with another task.
+//
+// This matches on the error text rather than asserting on *types.Error. govcd does return a
+// typed error carrying MinorErrorCode, but the wrapping chain between here and there uses
+// %s/%v rather than %w (see addTkgVMToVApp and govcd's ExecuteTaskRequest), so the type
+// is flattened to a string before this code sees it. If that chain is ever changed to wrap
+// with %w, this should become an errors.As check against *types.Error.MinorErrorCode.
+func isVAppContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range vAppContentionCodes {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// deferOnVAppContention decides whether err should be treated as transient vApp contention.
+// When it is, it records the deferral and returns a jittered requeue so the caller can
+// return a nil error: contention is an expected condition, and returning it as an error
+// engages controller-runtime's exponential backoff (5ms doubling to a 1000s cap), which is
+// what causes provisioning to stall after sustained contention.
+//
+// Returns deferred=false when the error is not contention, or when this machine has already
+// deferred too many times, in which case the caller should handle err normally.
+func (r *VCDMachineReconciler) deferOnVAppContention(ctx context.Context,
+	machine *clusterv1.Machine, err error) (ctrl.Result, bool) {
+
+	if !isVAppContentionError(err) {
+		return ctrl.Result{}, false
+	}
+
+	log := ctrl.LoggerFrom(ctx)
+	key := client.ObjectKeyFromObject(machine)
+
+	count := 1
+	if prev, ok := r.vAppContentionDeferrals.Load(key); ok {
+		if n, isInt := prev.(int); isInt {
+			count = n + 1
+		}
+	}
+
+	if count > maxVAppContentionDeferrals {
+		r.vAppContentionDeferrals.Delete(key)
+		log.Error(err, "vApp still contended after the maximum number of deferrals; "+
+			"reporting the error so it surfaces and backoff applies",
+			"machine", machine.Name, "deferrals", maxVAppContentionDeferrals)
+		return ctrl.Result{}, false
+	}
+
+	r.vAppContentionDeferrals.Store(key, count)
+	//nolint:gosec // not cryptographic; jitter only needs to de-synchronise retries
+	wait := vAppContentionRequeueBase + time.Duration(rand.Int63n(int64(vAppContentionRequeueJitter)))
+	log.Info("vApp is busy with another task; deferring instead of failing",
+		"machine", machine.Name, "deferral", count, "requeueAfter", wait.String())
+	return ctrl.Result{RequeueAfter: wait}, true
+}
+
+// clearVAppContention forgets any contention deferrals recorded for a machine.
+func (r *VCDMachineReconciler) clearVAppContention(machine *clusterv1.Machine) {
+	r.vAppContentionDeferrals.Delete(client.ObjectKeyFromObject(machine))
+}
 
 func (r *VCDMachineReconciler) waitForPostCustomizationPhase(ctx context.Context,
 	vcdClient *vcdsdk.Client, vm *govcd.VM, phase string) error {
@@ -428,10 +606,10 @@ func (r *VCDMachineReconciler) reconcileNodeSetupScripts(ctx context.Context, vc
 func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClient *vcdsdk.Client,
 	vdcManager *vcdsdk.VdcManager, vApp *govcd.VApp, vm *govcd.VM, vmName string, bootstrapData []byte, bootstrapFormat string,
 	vcdCluster *infrav1beta3.VCDCluster, machine *clusterv1.Machine,
-	isInitialControlPlane, isResizedControlPlane, skipRDEEventUpdates bool) error {
+	isInitialControlPlane, isResizedControlPlane, skipRDEEventUpdates bool) (ctrl.Result, error) {
 
 	if vApp == nil || vApp.VApp == nil {
-		return fmt.Errorf("reconcileVMBootstrap is called with a nil VAPP")
+		return ctrl.Result{}, fmt.Errorf("reconcileVMBootstrap is called with a nil VAPP")
 	}
 	log := ctrl.LoggerFrom(ctx, "cluster", vcdCluster.Name, "machine", machine.Name, "vAppName", vApp.VApp.Name)
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(vcdClient, vcdCluster.Status.InfraId)
@@ -440,7 +618,7 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 	if err != nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
 
-		return errors.Wrapf(err, "Error while provisioning the infrastructure VM for the machine [%s] of the cluster [%s]; failed to get status of vm", vm.VM.Name, vApp.VApp.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error while provisioning the infrastructure VM for the machine [%s] of the cluster [%s]; failed to get status of vm", vm.VM.Name, vApp.VApp.Name)
 	}
 	if err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.VCDMachineCreationError, "", ""); err != nil {
 		log.Error(err, "failed to remove VCDMachineCreationError from RDE")
@@ -448,7 +626,7 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 
 	vAppName, err := CreateFullVAppName(ctx, r.Client, vdcManager.Vdc.Vdc.ID, vcdCluster, machine)
 	if err != nil {
-		return errors.Wrapf(err, "error occurred while creating vApp name for the cluster [%s] with VDC ID [%s]",
+		return ctrl.Result{}, errors.Wrapf(err, "error occurred while creating vApp name for the cluster [%s] with VDC ID [%s]",
 			vcdCluster.Name, vdcManager.Vdc.Vdc.ID)
 	}
 
@@ -468,12 +646,12 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 			if err != nil {
 				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
 
-				return errors.Wrapf(err, "Error while generating network initialization script for ignition [%s/%s]", vcdCluster.Name, vm.VM.Name)
+				return ctrl.Result{}, errors.Wrapf(err, "Error while generating network initialization script for ignition [%s/%s]", vcdCluster.Name, vm.VM.Name)
 			}
 			// GZip then Base64 encode bootstrap data
 			gzipb64encodedData, err := gzipAndBase64Encode([]byte(bootstrapData))
 			if err != nil {
-				return errors.Wrapf(err, "Failed to gzip and base64 encode bootstrap data for ignition [%s/%s]", vcdCluster.Name, vm.VM.Name)
+				return ctrl.Result{}, errors.Wrapf(err, "Failed to gzip and base64 encode bootstrap data for ignition [%s/%s]", vcdCluster.Name, vm.VM.Name)
 			}
 			keyVals = map[string]string{
 				"guestinfo.ignition.config.data":          gzipb64encodedData,
@@ -484,18 +662,33 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 			}
 		}
 
+		// Each of the two tasks below is locked for its own call-plus-wait span, not one span
+		// covering both, so the time between them does not hold the lock.
+		locks := r.lockSetFor(vAppName)
+
 		keys := capvcdutil.Keys(keyVals)
-		task, err := vdcManager.SetMultiVmExtraConfigKeyValuePairs(vm, keyVals, true)
+		_, err, failedWaitingForExtraConfigTask := func() (govcd.Task, error, bool) {
+			// The extra-config write resends the VM's NIC section, and VCD serialises it with
+			// other VMs' extra-config and network updates.
+			unlock := locks.lockVMNIC()
+			defer unlock()
+			task, err := vdcManager.SetMultiVmExtraConfigKeyValuePairs(vm, keyVals, true)
+			if err != nil {
+				return task, err, false
+			}
+			return task, task.WaitTaskCompletion(), true
+		}()
 		if err != nil {
+			if res, deferred := r.deferOnVAppContention(ctx, machine, err); deferred {
+				return res, nil
+			}
 			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
 
-			return errors.Wrapf(err, "Error while enabling cloudinit on the machine [%s/%s]; unable to set vm extra config keys [%v] for vm ",
-				vAppName, vm.VM.Name, keys)
-		}
-		if err = task.WaitTaskCompletion(); err != nil {
-			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
-
-			return errors.Wrapf(err, "Error while waiting for task that sets keys [%v] machine [%s/%s]",
+			if !failedWaitingForExtraConfigTask {
+				return ctrl.Result{}, errors.Wrapf(err, "Error while enabling cloudinit on the machine [%s/%s]; unable to set vm extra config keys [%v] for vm ",
+					vAppName, vm.VM.Name, keys)
+			}
+			return ctrl.Result{}, errors.Wrapf(err, "Error while waiting for task that sets keys [%v] machine [%s/%s]",
 				keys, vAppName, vm.VM.Name)
 		}
 		err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.VCDMachineCreationError, "", machine.Name)
@@ -505,29 +698,40 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 
 		log.Info(fmt.Sprintf("Configured the infra machine with keys [%v] to enable cloud-init", keys))
 
-		task, err = vm.PowerOn()
+		_, err, failedWaitingForPowerOnTask := func() (govcd.Task, error, bool) {
+			unlock := locks.lockVM()
+			defer unlock()
+			task, err := vm.PowerOn()
+			if err != nil {
+				return task, err, false
+			}
+			return task, task.WaitTaskCompletion(), true
+		}()
 		if err != nil {
+			if res, deferred := r.deferOnVAppContention(ctx, machine, err); deferred {
+				return res, nil
+			}
 			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
 
-			return errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; unable to power on VM", vcdCluster.Name, vm.VM.Name)
+			if !failedWaitingForPowerOnTask {
+				return ctrl.Result{}, errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; unable to power on VM", vcdCluster.Name, vm.VM.Name)
+			}
+			return ctrl.Result{}, errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; error waiting for VM power-on task completion", vcdCluster.Name, vm.VM.Name)
 		}
-		if err = task.WaitTaskCompletion(); err != nil {
-			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
+		r.clearVAppContention(machine)
 
-			return errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; error waiting for VM power-on task completion", vcdCluster.Name, vm.VM.Name)
-		}
-
-		if err = vApp.Refresh(); err != nil {
-			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("%v", err))
-
-			return errors.Wrapf(err, "Error while deploying infra for the machine [%s/%s]; unable to refresh vapp after VM power-on", vAppName, vm.VM.Name)
-		}
+		// vApp is deliberately not refreshed here. Its result was never read: nothing
+		// below this point in the function -- or in reconcileVM/reconcileNormal after
+		// this function returns -- reads vApp again (they all use vm, not vApp). Same
+		// reasoning as the two vApp.Refresh() removals documented further down in this
+		// function; a deep vApp fetch measures at roughly 10 seconds in this environment,
+		// so a call whose result nobody reads is not a trivial thing to leave in place.
 	}
 
 	if hasCloudInitFailedBefore, err := r.hasCloudInitExecutionFailedBefore(vcdClient, vm); hasCloudInitFailedBefore {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineScriptExecutionError, "", machine.Name, fmt.Sprintf("%v", err))
 
-		return errors.Wrapf(err, "Error bootstrapping the machine [%s/%s]; machine is probably in unreconciliable state", vAppName, vm.VM.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error bootstrapping the machine [%s/%s]; machine is probably in unreconciliable state", vAppName, vm.VM.Name)
 	}
 	capvcdRdeManager.AddToEventSet(ctx, capisdk.InfraVmPoweredOn, "", machine.Name, "", skipRDEEventUpdates)
 
@@ -550,18 +754,17 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 		}
 
 		for _, phase := range phases {
-			if err = vApp.Refresh(); err != nil {
-				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineScriptExecutionError, "", machine.Name, fmt.Sprintf("%v", err))
-
-				return errors.Wrapf(err, "Error while bootstrapping the machine [%s/%s]; unable to refresh vapp",
-					vAppName, vm.VM.Name)
-			}
+			// No vApp.Refresh() here on purpose. Refreshing the vApp retrieves the entire
+			// vApp document (~8MB on a 90 node cluster) once per phase, and the result was
+			// never read: waitForPostCustomizationPhase below takes the *VM*, calls
+			// vm.Refresh() itself and reads the guest customization status from the VM.
+			// vApp is neither passed to it nor re-derived from afterwards.
 			log.Info(fmt.Sprintf("Start: waiting for the bootstrapping phase [%s] to complete", phase))
 			if err = r.waitForPostCustomizationPhase(ctx, vcdClient, vm, phase); err != nil {
 				log.Error(err, fmt.Sprintf("Error waiting for the bootstrapping phase [%s] to complete", phase))
 				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineScriptExecutionError, "", machine.Name, fmt.Sprintf("%v", err))
 
-				return errors.Wrapf(err, "Error while bootstrapping the machine [%s/%s]; unable to wait for post customization phase [%s]",
+				return ctrl.Result{}, errors.Wrapf(err, "Error while bootstrapping the machine [%s/%s]; unable to wait for post customization phase [%s]",
 					vAppName, vm.VM.Name, phase)
 			}
 			log.Info(fmt.Sprintf("End: waiting for the bootstrapping phase [%s] to complete", phase))
@@ -579,19 +782,18 @@ func (r *VCDMachineReconciler) reconcileVMBootstrap(ctx context.Context, vcdClie
 	if err = vm.Refresh(); err != nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("Unable to refresh vm: %v", err))
 
-		return errors.Wrapf(err, "Unexpected error after the machine [%s/%s] is bootstrapped; unable to refresh vm", vAppName, vm.VM.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Unexpected error after the machine [%s/%s] is bootstrapped; unable to refresh vm", vAppName, vm.VM.Name)
 	}
-	if err = vApp.Refresh(); err != nil {
-		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name, fmt.Sprintf("Unable to refresh vApp: %v", err))
-
-		return errors.Wrapf(err, "Unexpected error after the machine [%s/%s] is bootstrapped; unable to refresh vapp", vAppName, vm.VM.Name)
-	}
+	// The vApp is deliberately not refreshed here. This is the last statement before the
+	// function returns nil, and the caller (reconcileVM) does not read vApp afterwards, so
+	// the retrieved document was discarded. vm.Refresh() above is the one that matters --
+	// the caller does use the VM.
 
 	err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.VCDMachineCreationError, "", machine.Name)
 	if err != nil {
 		log.Error(err, "failed to remove VCDMachineCreationError from RDE", "rdeID", vcdCluster.Status.InfraId)
 	}
-	return nil
+	return ctrl.Result{}, nil
 }
 
 func gzipAndBase64Encode(data []byte) (string, error) {
@@ -724,9 +926,88 @@ func CreateFullVAppName(ctx context.Context, cli client.Client, ovdcID string,
 	}
 }
 
+// vAppHasNetworkAttached reports whether ovdcNetworkName is already present in vApp's
+// network configuration.
+//
+// This intentionally mirrors the vendored, unexported
+// VdcManager.isVappNetworkPresentInVapp (cloud-provider-for-cloud-director's
+// pkg/vcdsdk/vapp.go) field-for-field: GetOrCreateVApp uses that exact check to decide
+// whether it needs to mutate an already-existing vApp (by adding the network to it), and
+// callers here need to make the same decision *before* calling GetOrCreateVApp in order
+// to know whether the call can safely skip the vApp's mutation lock. CAPVCD cannot call
+// the unexported method directly, so this is kept as a byte-for-byte copy rather than a
+// approximation -- if it drifts from the upstream check, a vApp missing its network
+// could wrongly be treated as already-attached, so keep it in sync if that check ever
+// changes upstream.
+//
+// It is deliberately conservative: a nil vApp, nil VApp, or nil/absent network sections
+// all yield false, matching the vendored function precisely, so an uncertain state is
+// always treated as "not attached" and routed through the safe, locked path.
+func vAppHasNetworkAttached(vApp *govcd.VApp, ovdcNetworkName string) bool {
+	if vApp == nil || vApp.VApp == nil {
+		return false
+	}
+	if vApp.VApp.NetworkConfigSection == nil || vApp.VApp.NetworkConfigSection.NetworkConfig == nil {
+		return false
+	}
+	for _, vAppNetwork := range vApp.VApp.NetworkConfigSection.NetworkNames() {
+		if vAppNetwork == ovdcNetworkName {
+			return true
+		}
+	}
+	return false
+}
+
+// vAppMetadataMatches reports whether every entry of want is already present on the
+// vApp with the same value. It reads the vApp's metadata once, regardless of how many
+// keys are checked.
+//
+// It is deliberately conservative: a nil vApp, an empty want, a read failure or any
+// missing/differing key all yield false, so the caller writes the metadata just as it
+// would have before. The only case that returns true is one where the write is
+// provably a no-op.
+func vAppMetadataMatches(vApp *govcd.VApp, want map[string]string) bool {
+	if vApp == nil || vApp.VApp == nil || len(want) == 0 {
+		return false
+	}
+	metadata, err := vApp.GetMetadata()
+	if err != nil || metadata == nil {
+		return false
+	}
+	return metadataEntriesMatch(metadata.MetadataEntry, want)
+}
+
+// metadataEntriesMatch reports whether every entry of want appears in entries with the
+// same value. Records carrying no value are skipped rather than read as an empty string,
+// so a malformed entry can never make a differing key look like a match.
+func metadataEntriesMatch(entries []*types.MetadataEntry, want map[string]string) bool {
+	if len(want) == 0 {
+		return false
+	}
+	have := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.TypedValue == nil {
+			continue
+		}
+		have[entry.Key] = entry.TypedValue.Value
+	}
+	for key, value := range want {
+		if got, ok := have[key]; !ok || got != value {
+			return false
+		}
+	}
+	return true
+}
+
+// reconcileVAppCreation ensures the cluster's vApp exists (creating it if necessary) and
+// returns it alongside the usual (ctrl.Result, error) pair. Returning the vApp lets
+// callers reuse it directly instead of fetching it again immediately afterwards -- a
+// deep vApp fetch (GetVAppByName/GetOrCreateVApp/Refresh, all fetching the same full
+// document) measures at roughly 10 seconds against this environment's vApp, so an
+// avoidable extra fetch right after this function returns is not a rounding error.
 func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdClient *vcdsdk.Client,
 	machineName string, vcdCluster *infrav1beta3.VCDCluster,
-	vAppName string, ovdcNetworkName string, skipRDEEventUpdates bool) (ctrl.Result, error) {
+	vAppName string, ovdcNetworkName string, skipRDEEventUpdates bool) (*govcd.VApp, ctrl.Result, error) {
 
 	log := ctrl.LoggerFrom(ctx, "machine", machineName, "cluster", vcdCluster.Name, "vAppName", vAppName)
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(vcdClient, vcdCluster.Status.InfraId)
@@ -736,7 +1017,7 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 	if err != nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterError, "", vcdCluster.Name,
 			fmt.Sprintf("failed to get vdcManager: [%v]", err))
-		return ctrl.Result{}, errors.Wrapf(err,
+		return nil, ctrl.Result{}, errors.Wrapf(err,
 			"Error creating vdc manager to reconcile vcd infrastructure for cluster [%s]", vcdCluster.Name)
 	}
 	metadataMap := map[string]string{
@@ -745,29 +1026,62 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 	if vdcManager.Vdc == nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterError, "",
 			vcdCluster.Name, fmt.Sprintf("%v", err))
-		return ctrl.Result{}, errors.Errorf("no Vdc created with vdc manager name [%s]", vdcManager.Client.ClusterOVDCIdentifier)
+		return nil, ctrl.Result{}, errors.Errorf("no Vdc created with vdc manager name [%s]", vdcManager.Client.ClusterOVDCIdentifier)
 	}
 	if err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD,
 		capisdk.VCDClusterError, "", ""); err != nil {
 		log.Error(err, "failed to remove VCDClusterError from RDE", "rdeID", vcdCluster.Status.InfraId)
 	}
 
-	_, err = vdcManager.Vdc.GetVAppByName(vAppName, true)
+	existingVApp, err := vdcManager.Vdc.GetVAppByName(vAppName, true)
 	if err != nil && err == govcd.ErrorEntityNotFound {
 		vcdCluster.Status.VAppMetadataUpdated = false
 	}
 
-	clusterVApp, err := vdcManager.GetOrCreateVApp(vAppName, ovdcNetworkName)
-	if err != nil {
-		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "", vAppName,
-			fmt.Sprintf("%v", err))
-		return ctrl.Result{}, errors.Wrapf(err, "Error creating Infra vApp for the cluster [%s]: [%v]",
-			vcdCluster.Name, err)
+	// Looking up the lock set is a sync.Map lookup, not a lock acquisition.
+	locks := r.lockSetFor(vAppName)
+
+	// GetOrCreateVApp only actually mutates VCD when the vApp doesn't exist yet, or when
+	// it exists but the requested ovdc network isn't attached to it -- every other case
+	// is just the read above, repeated. We already have that read's result in hand, so
+	// when neither mutation case applies, reuse it directly and skip the lock entirely
+	// instead of taking it only to have GetOrCreateVApp redo the identical read
+	// internally and hand back an equivalent object.
+	//
+	// This is not just a saved API call: every machine funnels through this check on
+	// every reconcile while it is still provisioning, and if it lands while another
+	// machine's real mutation (a disk resize can run tens of seconds) is in flight, it
+	// would otherwise queue behind that unrelated mutation for no reason -- it was only
+	// ever going to read. Skipping the lock here keeps pure reads from competing for the
+	// same turn as machines that actually need to mutate the vApp. Measured on a busy
+	// vApp, that queueing was costing 27-80s per reconcile for a call that, freed of the
+	// wait, completes in a fraction of a second.
+	//
+	// A real error from the read above (anything other than ErrorEntityNotFound) also
+	// falls through to the locked path below: GetOrCreateVApp performs the identical
+	// read internally, so it will simply encounter and report the same error through its
+	// existing, already-correct error handling rather than this needing a second copy of
+	// it here.
+	var clusterVApp *govcd.VApp
+	if err == nil && vAppHasNetworkAttached(existingVApp, ovdcNetworkName) {
+		clusterVApp = existingVApp
+	} else {
+		clusterVApp, err = func() (*govcd.VApp, error) {
+			unlock := locks.lockVAppWide()
+			defer unlock()
+			return vdcManager.GetOrCreateVApp(vAppName, ovdcNetworkName)
+		}()
+		if err != nil {
+			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "", vAppName,
+				fmt.Sprintf("%v", err))
+			return nil, ctrl.Result{}, errors.Wrapf(err, "Error creating Infra vApp for the cluster [%s]: [%v]",
+				vcdCluster.Name, err)
+		}
 	}
 	if clusterVApp == nil || clusterVApp.VApp == nil {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "",
 			vcdCluster.Name, fmt.Sprintf("%v", err))
-		return ctrl.Result{}, errors.Wrapf(err, "found nil value for VApp [%s]", vAppName)
+		return nil, ctrl.Result{}, errors.Wrapf(err, "found nil value for VApp [%s]", vAppName)
 	}
 
 	// AMK: TODO: this is likely not needed since the resourceset will get added later.
@@ -783,11 +1097,27 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 	//}
 
 	if metadataMap != nil && !vcdCluster.Status.VAppMetadataUpdated {
-		if err := vdcManager.AddMetadataToVApp(vAppName, metadataMap); err != nil {
-			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterError, "", vAppName,
-				fmt.Sprintf("failed to add metadata into vApp [%s]: [%v]", vcdCluster.Name, err))
-			return ctrl.Result{}, fmt.Errorf("unable to add metadata [%s] to vApp [%s]: [%v]", metadataMap,
-				vAppName, err)
+		// VAppMetadataUpdated is only ever assigned on the in-memory VCDCluster below:
+		// this controller patches VCDMachine and never VCDCluster, so the flag is not
+		// persisted and this branch is entered on every reconcile of a machine that is
+		// still provisioning. The metadata is a per-cluster constant, so those repeats
+		// rewrite a value that is already correct.
+		//
+		// That is not free: each write is a VCD task, and AddMetadataToVApp re-retrieves the
+		// whole vApp by name. Reading the metadata is cheap, so check first and write only
+		// when the value really needs to change.
+		if !vAppMetadataMatches(clusterVApp, metadataMap) {
+			addMetadataErr := func() error {
+				unlock := locks.lockMetadata()
+				defer unlock()
+				return vdcManager.AddMetadataToVApp(vAppName, metadataMap)
+			}()
+			if addMetadataErr != nil {
+				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterError, "", vAppName,
+					fmt.Sprintf("failed to add metadata into vApp [%s]: [%v]", vcdCluster.Name, addMetadataErr))
+				return nil, ctrl.Result{}, fmt.Errorf("unable to add metadata [%s] to vApp [%s]: [%v]", metadataMap,
+					vAppName, addMetadataErr)
+			}
 		}
 
 		// The following requires a patch to the vcdCluster object.
@@ -802,7 +1132,7 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vAppName,
 			fmt.Sprintf("failed to add VCD Resource [%s] of type [%s] from VCDResourceSet of RDE [%s]: [%v]",
 				vAppName, VcdResourceTypeVM, vcdCluster.Status.InfraId, err))
-		return ctrl.Result{}, errors.Wrapf(err,
+		return nil, ctrl.Result{}, errors.Wrapf(err,
 			"failed to add resource [%s] of type [%s] to VCDResourceSet of RDE [%s]: [%v]",
 			vAppName, VCDResourceVApp, vcdCluster.Status.InfraId, err)
 	}
@@ -817,7 +1147,7 @@ func (r *VCDMachineReconciler) reconcileVAppCreation(ctx context.Context, vcdCli
 			"rdeID", vcdCluster.Status.InfraId)
 	}
 
-	return ctrl.Result{}, nil
+	return clusterVApp, ctrl.Result{}, nil
 }
 
 func (r *VCDMachineReconciler) reconcileVM(
@@ -835,7 +1165,14 @@ func (r *VCDMachineReconciler) reconcileVM(
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(vcdClient, vcdCluster.Status.InfraId)
 
 	vmExists := true
-	vm, err := vApp.GetVMByName(vmName, true)
+	// refresh=false: vApp was fetched fresh by the caller (reconcileVAppCreation, via
+	// reconcileNormal) immediately before this call, with no mutation in between -- a
+	// refresh here would just re-fetch the identical, already-current document. A deep
+	// vApp fetch measures at roughly 10 seconds in this environment, so this is not a
+	// trivial saving. GetVMByName still fetches the individual VM by its own HREF
+	// regardless of refresh, so this only skips the redundant *vApp-wide* re-fetch, not
+	// the read of the VM itself.
+	vm, err := vApp.GetVMByName(vmName, false)
 	if err != nil && err != govcd.ErrorEntityNotFound {
 		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "",
 			machine.Name, fmt.Sprintf("%v", err))
@@ -849,7 +1186,10 @@ func (r *VCDMachineReconciler) reconcileVM(
 		log.Info("Adding infra VM for the machine")
 
 		// vcda-4391 fixed
-		task, err := vdcManager.AddNewTkgVM(vmName, vAppName,
+		//
+		// The catalog, template, policy and storage profile lookups do not depend on the vApp's
+		// state, so they run before taking the vApp-wide lock.
+		spec, err := resolveTkgVMCreationSpec(vdcManager, vmName,
 			vcdMachine.Spec.Catalog, vcdMachine.Spec.Template, vcdMachine.Spec.PlacementPolicy,
 			vcdMachine.Spec.SizingPolicy, vcdMachine.Spec.StorageProfile)
 		if err != nil {
@@ -859,13 +1199,37 @@ func (r *VCDMachineReconciler) reconcileVM(
 				"Error provisioning infrastructure for the machine; unable to create VM [%s] in vApp [%s]",
 				machine.Name, vAppName)
 		}
-		if err = task.WaitTaskCompletion(); err != nil {
+
+		// Both the create call and waiting for its task happen under the lock: VCD's
+		// serialisation covers the whole task, not just accepting the request.
+		task, err, failedWaitingForTask := func() (govcd.Task, error, bool) {
+			unlock := r.lockSetFor(vAppName).lockVAppWide()
+			defer unlock()
+			task, err := addTkgVMToVApp(vdcManager, vApp, spec)
+			if err != nil {
+				return task, err, false
+			}
+			return task, task.WaitTaskCompletion(), true
+		}()
+		if err != nil {
+			if res, deferred := r.deferOnVAppContention(ctx, machine, err); deferred {
+				return res, nil, "", nil
+			}
 			capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "", machine.Name,
 				fmt.Sprintf("%v", err))
+			if !failedWaitingForTask {
+				return ctrl.Result{}, nil, "", errors.Wrapf(err,
+					"Error provisioning infrastructure for the machine; unable to create VM [%s] in vApp [%s]",
+					machine.Name, vAppName)
+			}
 			return ctrl.Result{}, nil, "", errors.Wrapf(err,
 				"Error provisioning infrastructure for the machine; unable to wait for task [%v] for create VM [%s] in vApp [%s]",
 				task, machine.Name, vAppName)
 		}
+		// The VM was created, so any contention deferrals recorded for this machine are
+		// no longer relevant. Clearing here keeps the counter bounded to a single
+		// creation attempt rather than accumulating across the machine's lifetime.
+		r.clearVAppContention(machine)
 
 		vm, err = vApp.GetVMByName(vmName, true)
 		if err != nil {
@@ -1014,13 +1378,29 @@ func (r *VCDMachineReconciler) reconcileVM(
 			diskSettings[0].SizeMb = diskSize
 			vm.VM.VmSpecSection.DiskSection.DiskSettings = diskSettings
 
-			if _, err = vm.UpdateInternalDisks(vm.VM.VmSpecSection); err != nil {
+			// UpdateInternalDisks is the synchronous variant (it waits for its task
+			// internally, unlike UpdateInternalDisksAsync), so the single call is the
+			// whole critical section here.
+			_, err = func() (*types.VmSpecSection, error) {
+				unlock := r.lockSetFor(vAppName).lockVM()
+				defer unlock()
+				return vm.UpdateInternalDisks(vm.VM.VmSpecSection)
+			}()
+			if err != nil {
+				if res, deferred := r.deferOnVAppContention(ctx, machine, err); deferred {
+					return res, nil, "", nil
+				}
 				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineCreationError, "",
 					machine.Name, fmt.Sprintf("%v", err))
 				return ctrl.Result{}, nil, "",
 					errors.Wrapf(err, "Error while provisioning the infrastructure VM for the machine [%s] "+
 						"of the cluster [%s]; failed to resize hard disk", vm.VM.Name, vApp.VApp.Name)
 			}
+			// The resize went through, so any contention deferrals recorded for this
+			// machine (whether from this resize or an earlier operation this reconcile
+			// didn't reach) are stale; clear them so a later, unrelated operation on this
+			// machine starts with a full deferral budget.
+			r.clearVAppContention(machine)
 		}
 		if err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD,
 			capisdk.VCDMachineCreationError, "", ""); err != nil {
@@ -1207,19 +1587,17 @@ func (r *VCDMachineReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	}
 	log.Info(fmt.Sprintf("Using VApp name [%s] for the machine [%s]", vAppName, machine.Name))
 
-	result, err := r.reconcileVAppCreation(ctx, vcdClient, machine.Name, vcdCluster, vAppName, ovdcNetworkName, false)
+	vApp, result, err := r.reconcileVAppCreation(ctx, vcdClient, machine.Name, vcdCluster, vAppName, ovdcNetworkName, false)
 	if err != nil {
 		log.Error(err, "failed to reconcile vApp", "vAppName", vAppName)
 		return result, errors.Wrapf(err, "unable to reconcile vApp [%s] for cluster [%s]", vAppName, vcdCluster.Name)
 	}
-
-	vApp, err := vdcManager.Vdc.GetVAppByName(vAppName, true)
-	if err != nil {
-		capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDClusterVappCreationError, "", machine.Name, fmt.Sprintf("%v", err))
-		return ctrl.Result{}, errors.Wrapf(err,
-			"Error provisioning infrastructure VApp for the machine [%s] of the cluster [%s]",
-			machine.Name, vcdCluster.Name)
-	}
+	// reconcileVAppCreation already fetched (or just created) this exact vApp; a nil err
+	// from it guarantees a non-nil vApp with a non-nil vApp.VApp (see its own final
+	// return and the nil-check right before it). Reusing it here instead of fetching the
+	// same document again is not a trivial saving: a deep fetch of this vApp measures at
+	// roughly 10 seconds in this environment, so this removes one guaranteed ~10s call
+	// from every machine's reconcile.
 	err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.VCDClusterVappCreationError, "", "")
 	if err != nil {
 		log.Error(err, "failed to remove VCDClusterVappCreationError from RDE", "rdeID", vcdCluster.Status.InfraId)
@@ -1282,10 +1660,16 @@ func (r *VCDMachineReconciler) reconcileNormal(ctx context.Context, cluster *clu
 		}
 	}
 
-	err = r.reconcileVMBootstrap(ctx, vcdClient, vdcManager, vApp, vm, vmName, bootstrapData, bootstrapFormat, vcdCluster, machine,
+	result, err = r.reconcileVMBootstrap(ctx, vcdClient, vdcManager, vApp, vm, vmName, bootstrapData, bootstrapFormat, vcdCluster, machine,
 		isInitialControlPlane, isResizedControlPlane, skipRDEEventUpdates)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "failed to bootstrap VM [%s/%s]", vAppName, vmName)
+	} else if result.Requeue || result.RequeueAfter > 0 {
+		// Bootstrap has not completed (the vApp was busy); the machine must not be marked
+		// bootstrapped below.
+		log.Info("Re queuing the request",
+			"result.Requeue", result.Requeue, "result.RequeueAfter", result.RequeueAfter.String())
+		return result, nil
 	}
 
 	// Update load-balancer pool with the IP of the control plane node as a new member.
@@ -1394,6 +1778,10 @@ func getPrimaryNetwork(vm *types.Vm) *types.NetworkConnection {
 // reconcileVMNetworks ensures that desired networks are attached to VMs
 // networks[0] refers the primary network
 func (r *VCDMachineReconciler) reconcileVMNetworks(vdcManager *vcdsdk.VdcManager, vApp *govcd.VApp, vm *govcd.VM, networks []string) error {
+	// vApp.VApp.Name is the actual vApp this VM belongs to -- for DCGroup (multi-zone)
+	// clusters that is one vApp per MachineDeployment, not one per cluster.
+	locks := r.lockSetFor(vApp.VApp.Name)
+
 	connections, err := vm.GetNetworkConnectionSection()
 	if err != nil {
 		return errors.Wrapf(err, "Failed to get attached networks to VM")
@@ -1402,7 +1790,7 @@ func (r *VCDMachineReconciler) reconcileVMNetworks(vdcManager *vcdsdk.VdcManager
 	desiredConnectionArray := make([]*types.NetworkConnection, len(networks))
 
 	for index, ovdcNetwork := range networks {
-		err = ensureNetworkIsAttachedToVApp(vdcManager, vApp, ovdcNetwork)
+		err = ensureNetworkIsAttachedToVApp(vdcManager, vApp, ovdcNetwork, locks)
 		if err != nil {
 			return errors.Wrapf(err, "Error ensuring network [%s] is attached to vApp", ovdcNetwork)
 		}
@@ -1418,7 +1806,11 @@ func (r *VCDMachineReconciler) reconcileVMNetworks(vdcManager *vcdsdk.VdcManager
 			connection.NetworkConnectionIndex = index
 		}
 
-		err = vm.UpdateNetworkConnectionSection(connections)
+		err = func() error {
+			unlock := locks.lockVMNIC()
+			defer unlock()
+			return vm.UpdateNetworkConnectionSection(connections)
+		}()
 		if err != nil {
 			return errors.Wrapf(err, "failed to update networks of VM")
 		}
@@ -1466,7 +1858,10 @@ func getNetworkConnection(connections *types.NetworkConnectionSection, ovdcNetwo
 	}
 }
 
-func ensureNetworkIsAttachedToVApp(vdcManager *vcdsdk.VdcManager, vApp *govcd.VApp, ovdcNetworkName string) error {
+// ensureNetworkIsAttachedToVApp locks only around AddOrgNetwork, the one call here that
+// mutates the vApp; the membership check reads data already fetched into vApp. Attaching a
+// network changes the vApp itself, so it takes the vApp-wide lock.
+func ensureNetworkIsAttachedToVApp(vdcManager *vcdsdk.VdcManager, vApp *govcd.VApp, ovdcNetworkName string, locks *vAppLockSet) error {
 	for _, vAppNetwork := range vApp.VApp.NetworkConfigSection.NetworkNames() {
 		if vAppNetwork == ovdcNetworkName {
 			return nil
@@ -1478,7 +1873,11 @@ func ensureNetworkIsAttachedToVApp(vdcManager *vcdsdk.VdcManager, vApp *govcd.VA
 		return fmt.Errorf("unable to get ovdc network [%s]: [%v]", ovdcNetworkName, err)
 	}
 
-	_, err = vApp.AddOrgNetwork(&govcd.VappNetworkSettings{}, ovdcNetwork.OrgVDCNetwork, false)
+	_, err = func() (*types.NetworkConfigSection, error) {
+		unlock := locks.lockVAppWide()
+		defer unlock()
+		return vApp.AddOrgNetwork(&govcd.VappNetworkSettings{}, ovdcNetwork.OrgVDCNetwork, false)
+	}()
 	if err != nil {
 		return fmt.Errorf("unable to add ovdc network [%v] to vApp [%s]: [%v]",
 			ovdcNetwork, vApp.VApp.Name, err)
@@ -1534,6 +1933,7 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 	}
 
 	if vcdCluster.Spec.Site == "" {
+		r.clearVAppContention(machine)
 		controllerutil.RemoveFinalizer(vcdMachine, infrav1beta3.MachineFinalizer)
 		return ctrl.Result{}, nil
 	}
@@ -1707,7 +2107,10 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		vm, err := vApp.GetVMByName(vmName, true)
+		// refresh=false: vApp was fetched fresh just above in this same reconcile, and
+		// only RDE bookkeeping calls (no vApp mutation) happened in between, so it is
+		// still current. See the identical reasoning in reconcileVM.
+		vm, err := vApp.GetVMByName(vmName, false)
 		if err != nil {
 			if err == govcd.ErrorEntityNotFound {
 				log.Error(err, "Error while deleting the machine; VM  not found")
@@ -1733,6 +2136,10 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 				}
 			}
 
+			// Power-off and delete on different VMs run concurrently in VCD, but both are
+			// rejected while a VM is being added, hence the shared lock.
+			locks := r.lockSetFor(vAppName)
+
 			// power-off the VM if it is powered on
 			vmStatus, err := vm.GetStatus()
 			if err != nil {
@@ -1740,24 +2147,53 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 			} else {
 				// continue and try to power-off in any case
 				klog.Infof("VM [%s] has status [%s]", vm.VM.Name, vmStatus)
-				task, err := vm.PowerOff()
-				if err != nil {
-					klog.Warningf("Error while powering off VM [%s]: [%v]", vm.VM.Name, err)
-				} else {
-					if err = task.WaitTaskCompletion(); err != nil {
-						capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineDeletionError, "", machine.Name, fmt.Sprintf("%v", err))
-
-						return ctrl.Result{}, fmt.Errorf("error waiting for task completion after reconfiguring vm: [%v]", err)
+				// The call and waiting for its task both happen under the lock, for the
+				// same reason as VM creation above: VCD's own serialisation covers the
+				// whole task, not just accepting the request.
+				powerOffErr, failedAtPowerOffCall := func() (error, bool) {
+					unlock := locks.lockVM()
+					defer unlock()
+					task, err := vm.PowerOff()
+					if err != nil {
+						return err, true
 					}
+					return task.WaitTaskCompletion(), false
+				}()
+				if failedAtPowerOffCall {
+					// A contended power-off must not fall through to vm.Delete() below: the
+					// VM is still powered on, so the delete would just fail with "Stop the VM
+					// and try again", wasting a full reconcile on a call that cannot succeed.
+					// Deferring lets the next reconcile retry the power-off directly instead.
+					if res, deferred := r.deferOnVAppContention(ctx, machine, powerOffErr); deferred {
+						return res, nil
+					}
+					if powerOffErr != nil {
+						klog.Warningf("Error while powering off VM [%s]: [%v]", vm.VM.Name, powerOffErr)
+					}
+				} else if powerOffErr != nil {
+					if res, deferred := r.deferOnVAppContention(ctx, machine, powerOffErr); deferred {
+						return res, nil
+					}
+					capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineDeletionError, "", machine.Name, fmt.Sprintf("%v", powerOffErr))
+
+					return ctrl.Result{}, fmt.Errorf("error waiting for task completion after reconfiguring vm: [%v]", powerOffErr)
 				}
 			}
 
 			// in any case try to delete the machine
 			log.Info("Deleting the infra VM of the machine")
-			if err := vm.Delete(); err != nil {
-				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineDeletionError, "", machine.Name, fmt.Sprintf("%v", err))
+			deleteErr := func() error {
+				unlock := locks.lockVM()
+				defer unlock()
+				return vm.Delete()
+			}()
+			if deleteErr != nil {
+				if res, deferred := r.deferOnVAppContention(ctx, machine, deleteErr); deferred {
+					return res, nil
+				}
+				capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineDeletionError, "", machine.Name, fmt.Sprintf("%v", deleteErr))
 
-				return ctrl.Result{}, errors.Wrapf(err, "error deleting the machine [%s/%s]", vAppName, vm.VM.Name)
+				return ctrl.Result{}, errors.Wrapf(deleteErr, "error deleting the machine [%s/%s]", vAppName, vm.VM.Name)
 			}
 		}
 		log.Info("Successfully deleted infra resources of the machine")
@@ -1786,6 +2222,13 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, machine *clu
 		log.Error(err, "failed to remove RdeError from RDE", "rdeID", vcdCluster.Status.InfraId)
 	}
 
+	// The machine's infra is fully torn down (or never existed) at this point in every path
+	// that reaches here, so any deferral count recorded for it -- from this deletion or an
+	// earlier create/resize attempt -- no longer refers to anything. Without this the
+	// sync.Map would keep an entry forever for a machine whose object is about to disappear
+	// for good, since deleted machines never reach the success or give-up paths that
+	// otherwise clear the counter.
+	r.clearVAppContention(machine)
 	controllerutil.RemoveFinalizer(vcdMachine, infrav1beta3.MachineFinalizer)
 	return ctrl.Result{}, nil
 }
